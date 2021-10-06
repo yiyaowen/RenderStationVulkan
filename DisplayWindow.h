@@ -20,6 +20,8 @@ class DisplayWindow : public QWidget {
 public:
     DisplayWindow();
 
+    void declareRenderResourceData();
+
     void initVulkanEngine();
 
 protected:
@@ -29,8 +31,30 @@ protected:
 
     void resizeEvent(QResizeEvent *event) override;
 
+    void keyPressEvent(QKeyEvent *event) override;
+
+    void keyReleaseEvent(QKeyEvent *event) override;
+
+    void mouseMoveEvent(QMouseEvent *event) override;
+
+    void wheelEvent(QWheelEvent *event) override;
+
 private:
     VulkanEngine engine = {};
+
+    void handleInputEvent();
+
+    std::unordered_map<Qt::Key, bool> m_keyStatusTable = {
+            { Qt::Key::Key_A, false }, { Qt::Key::Key_D, false },
+            { Qt::Key::Key_Q, false }, { Qt::Key::Key_E, false },
+            { Qt::Key::Key_W, false }, { Qt::Key::Key_S, false } };
+
+    QPointF m_currMousePos = {};
+    QPointF m_lastMousePos = {};
+
+    float m_cameraMoveSpeedScale = 0.02f;
+    float m_cameraRotateSpeedScale = 0.005f;
+    float m_cameraZoomSpeedScale = 0.002f;
 };
 
 #endif // DISPLAY_WINDOW_H

@@ -8,6 +8,8 @@
 ** Developed with Qt5 and Vulkan on macOS.
 */
 
+#include <glm/gtc/matrix_transform.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <exception>
@@ -45,6 +47,9 @@ void VulkanEngine::init(const VulkanEngineStructs::CreateInfo& info) {
     enumerateSupportedLayers();
 
     enumerateSupportedExtensions();
+
+    // Init dependent widgets.
+    buildCamera();
 
     // Init vulkan core.
     initCore();
@@ -88,9 +93,19 @@ void VulkanEngine::initCore() {
 
     createFramebuffers();
 
+    // Decide target desc set layout before creating pipelines.
+    createDescriptorSetLayout();
+
     createGraphicsPipelines();
 
     createCommandPool();
+
+    // Must prepare all resource data before creating command buffers.
+    createAllDeclaredVertexBuffers();
+    createAllDeclaredIndexBuffers();
+    createUniformBuffers();
+    createDescriptorPool();
+    createDescriptorSets();
 
     createCommandBuffers();
 
@@ -123,6 +138,38 @@ void VulkanEngine::destroyCore() {
     // Destroy: createCommandPool()
     vkDestroyCommandPool(m_device, m_commandPool, nullptr);
 
+    // Cleanup created buffers.
+    // Note that command buffers may depend on this data, so it should be destroyed after command pool.
+    for (auto& vertexBufferGroup : m_vertexBuffers) {
+        auto& vertexBuffer = vertexBufferGroup.second.clientResource;
+        vkDestroyBuffer(m_device, vertexBuffer.buffer, nullptr);
+        vkFreeMemory(m_device, vertexBuffer.memory, nullptr);
+
+        if (vertexBufferGroup.second.isServerResourceEnabled) {
+            vertexBuffer = vertexBufferGroup.second.serverResource;
+            vkDestroyBuffer(m_device, vertexBuffer.buffer, nullptr);
+            vkFreeMemory(m_device, vertexBuffer.memory, nullptr);
+        }
+    }
+
+    for (auto& indexBufferGroup : m_indexBuffers) {
+        auto& indexBuffer = indexBufferGroup.second.clientResource;
+        vkDestroyBuffer(m_device, indexBuffer.buffer, nullptr);
+        vkFreeMemory(m_device, indexBuffer.memory, nullptr);
+
+        indexBuffer = indexBufferGroup.second.serverResource;
+        vkDestroyBuffer(m_device, indexBuffer.buffer, nullptr);
+        vkFreeMemory(m_device, indexBuffer.memory, nullptr);
+    }
+
+    for (auto& uniformBuffer : m_uniformBuffer.resources) {
+        vkDestroyBuffer(m_device, uniformBuffer.buffer, nullptr);
+        vkFreeMemory(m_device, uniformBuffer.memory, nullptr);
+    }
+
+    // Destroy: createDescriptorPool()
+    vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+
     // Destroy: createGraphicsPipelines()
     for (auto& pipelineLayout : m_pipelineLayouts) {
         vkDestroyPipelineLayout(m_device, pipelineLayout.second, nullptr);
@@ -130,6 +177,11 @@ void VulkanEngine::destroyCore() {
 
     for (auto& graphicsPipeline : m_graphicsPipelines) {
         vkDestroyPipeline(m_device, graphicsPipeline.second, nullptr);
+    }
+
+    // Destroy: createDescriptorSetLayout()
+    for (auto& descSetLayout : m_descSetLayouts) {
+        vkDestroyDescriptorSetLayout(m_device, descSetLayout.second, nullptr);
     }
 
     // Destroy: createFramebuffers()
@@ -170,17 +222,24 @@ void VulkanEngine::destroyCore() {
 
 void VulkanEngine::mRenderFrame() {
 
-    // Render
+    // Frame start
 
     vkWaitForFences(m_device, 1, &m_fences["frame_in_flight"][m_currFrameIndex], VK_TRUE, UINT64_MAX);
 
     uint32_t  imageIndex;
     vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX, m_semaphores["image_available"][m_currFrameIndex], VK_NULL_HANDLE, &imageIndex);
+    m_currSwapchainImageIndex = imageIndex;
 
     if (m_fenceRefs["image_in_flight"][imageIndex] != VK_NULL_HANDLE) {
         vkWaitForFences(m_device, 1, &m_fenceRefs["image_in_flight"][imageIndex], VK_TRUE, UINT64_MAX);
     }
     m_fenceRefs["image_in_flight"][imageIndex] = m_fences["frame_in_flight"][m_currFrameIndex];
+
+    // Update uniform buffers
+
+    updateUniformBuffers();
+
+    // Render
 
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -241,7 +300,16 @@ void VulkanEngine::recreateSwapchain() {
 
     createFramebuffers();
 
+    // Decide target desc set layout before creating pipelines.
+    createDescriptorSetLayout();
+
     createGraphicsPipelines();
+
+    createUniformBuffers();
+
+    createDescriptorPool();
+
+    createDescriptorSets();
 
     // Note that command pool is not recreated here for the sake of efficiency.
     // Consequently, all command buffers should be freed in destroySwapchain.
@@ -258,6 +326,15 @@ void VulkanEngine::destroyOldSwapchain() {
     // Free: vkAllocateCommandBuffers()
     vkFreeCommandBuffers(m_device, m_commandPool, m_commandBuffers.size(), m_commandBuffers.data());
 
+    // Destroy: createUniformBuffers(), createDescriptorPool()
+    vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+
+    for (auto& uniformBuffer : m_uniformBuffer.resources) {
+        vkDestroyBuffer(m_device, uniformBuffer.buffer, nullptr);
+        vkFreeMemory(m_device, uniformBuffer.memory, nullptr);
+    }
+
+
     // Destroy: createGraphicsPipelines()
     for (auto& pipelineLayout : m_pipelineLayouts) {
         vkDestroyPipelineLayout(m_device, pipelineLayout.second, nullptr);
@@ -265,6 +342,11 @@ void VulkanEngine::destroyOldSwapchain() {
 
     for (auto& graphicsPipeline : m_graphicsPipelines) {
         vkDestroyPipeline(m_device, graphicsPipeline.second, nullptr);
+    }
+
+    // Destroy: createDescSetLayout()
+    for (auto& descSetLayout : m_descSetLayouts) {
+        vkDestroyDescriptorSetLayout(m_device, descSetLayout.second, nullptr);
     }
 
     // Destroy: createFramebuffers()
@@ -601,19 +683,30 @@ void VulkanEngine::createFramebuffers() {
 }
 
 void VulkanEngine::createGraphicsPipelines() {
+    static bool shaderFirstLoaded = true;
     // Make shader infos.
-    m_shaderContainer.addNewShader("vert", "vert.spv", "main", ShaderContainer::Vertex);
-    m_shaderContainer.addNewShader("frag", "frag.spv", "main", ShaderContainer::Fragment);
+    if (shaderFirstLoaded) {
+        shaderFirstLoaded = false;
+        m_shaderContainer.addGlslShader("vert", "../GLSL/shader.vert", "../GLSL/SPIR-V/vert.spv","main", ShaderContainer::Vertex);
+        m_shaderContainer.addGlslShader("frag", "../GLSL/shader.frag", "../GLSL/SPIR-V/frag.spv", "main", ShaderContainer::Fragment);
+    }
+    else {
+        m_shaderContainer.addCompiledShader("vert", "../GLSL/SPIR-V/vert.spv", "main", ShaderContainer::Vertex);
+        m_shaderContainer.addCompiledShader("frag", "../GLSL/SPIR-V/frag.spv", "main", ShaderContainer::Fragment);
+    }
 
     auto shaderStageInfos = m_shaderContainer.generateAllCreateInfos();
 
     // Make input assembly info.
+    auto vertexInputBindDesc = Vertex::generateBindingDescription();
+    auto vertexInputAttrDescs = Vertex::generateAttributeDescriptions();
+
     VkPipelineVertexInputStateCreateInfo vertexInputStateInfo = {};
     vertexInputStateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputStateInfo.vertexBindingDescriptionCount = 0;
-    vertexInputStateInfo.pVertexBindingDescriptions = nullptr;
-    vertexInputStateInfo.vertexAttributeDescriptionCount = 0;
-    vertexInputStateInfo.pVertexAttributeDescriptions = nullptr;
+    vertexInputStateInfo.vertexBindingDescriptionCount = 1;
+    vertexInputStateInfo.pVertexBindingDescriptions = &vertexInputBindDesc;
+    vertexInputStateInfo.vertexAttributeDescriptionCount = vertexInputAttrDescs.size();
+    vertexInputStateInfo.pVertexAttributeDescriptions = vertexInputAttrDescs.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateInfo ={};
     inputAssemblyStateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -624,8 +717,8 @@ void VulkanEngine::createGraphicsPipelines() {
     VkViewport viewport = {};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
-    viewport.width = m_swapchainExtent2D.width;
-    viewport.height = m_swapchainExtent2D.height;
+    viewport.width = static_cast<float>(m_swapchainExtent2D.width);
+    viewport.height = static_cast<float>(m_swapchainExtent2D.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
 
@@ -703,8 +796,8 @@ void VulkanEngine::createGraphicsPipelines() {
     // Create pipeline layout.
     VkPipelineLayoutCreateInfo layoutInfo = {};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 0;
-    layoutInfo.pSetLayouts = nullptr;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &m_descSetLayouts["main"];
     layoutInfo.pushConstantRangeCount = 0;
     layoutInfo.pPushConstantRanges = nullptr;
 
@@ -787,7 +880,22 @@ void VulkanEngine::createCommandBuffers() {
 
         vkCmdBindPipeline(m_commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelines["main"]);
 
-        vkCmdDraw(m_commandBuffers[i], 3, 1, 0, 0);
+        // Bind vertex data.
+        auto& vertexBuffer = m_vertexBuffers[m_currBindVertexBufferLabel];
+        VkBuffer vertexBuffers[] = { vertexBuffer.isServerResourceEnabled ?
+                                      vertexBuffer.serverResource.buffer :
+                                      vertexBuffer.clientResource.buffer };
+        VkDeviceSize offsets[] = { 0 };
+        vkCmdBindVertexBuffers(m_commandBuffers[i], 0, 1, vertexBuffers, offsets);
+
+        // Bind index data.
+        auto& indexBuffer = m_indexBuffers[m_currBindIndexBufferLabel];
+        vkCmdBindIndexBuffer(m_commandBuffers[i], indexBuffer.serverResource.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // Bind descriptor sets.
+        vkCmdBindDescriptorSets(m_commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayouts["main"], 0, 1, &m_descriptorSets[i], 0, nullptr);
+
+        vkCmdDrawIndexed(m_commandBuffers[i], indexBuffer.data.size(), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(m_commandBuffers[i]);
 
@@ -893,6 +1001,8 @@ VulkanEngineStructs::PhysicalDeviceInfo VulkanEngine::queryPhysicalDeviceInfo(Vk
     info.queueFamilyIndices = queryDeviceQueueFamilyIndices(device);
 
     info.swapchainDetails = queryDeviceSwapchainDetails(device);
+
+    vkGetPhysicalDeviceMemoryProperties(device, &info.memoryProperties);
 
     return info;
 }
@@ -1036,4 +1146,298 @@ VkExtent2D VulkanEngine::selectSwapchainExtent2D(const VkSurfaceCapabilitiesKHR&
         return extent2D;
 
 //    }
+}
+
+void VulkanEngine::declareVertices(const std::string& bufferLabel, bool enableServerBuffer, const std::vector<Vertex>& vertices) {
+    m_vertexBuffers.insert({ bufferLabel, { enableServerBuffer, vertices } });
+}
+
+void VulkanEngine::declareIndices(const std::string& bufferLabel, const std::vector<uint32_t>& indices) {
+    m_indexBuffers.insert({ bufferLabel, (IndexBuffer){ indices } });
+}
+
+void VulkanEngine::createCoherentVertexBuffer(const std::string& label, size_t vertexCount) {
+    // Only can create vertex buffer when it has been declared.
+    assert(m_vertexBuffers.find(label) != m_vertexBuffers.end());
+
+    auto& vertexBuffer = m_vertexBuffers[label].clientResource;
+
+    vertexBuffer.requirements = createExclusiveBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, sizeof(Vertex) * vertexCount,
+                                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                                      vertexBuffer.buffer, vertexBuffer.memory);
+}
+
+void VulkanEngine::createIsolatedVertexBuffer(const std::string& label, size_t vertexCount) {
+    // Only can create vertex buffer when it has been declared.
+    assert(m_vertexBuffers.find(label) != m_vertexBuffers.end());
+
+    auto& clientBuffer = m_vertexBuffers[label].clientResource;
+
+    clientBuffer.requirements = createExclusiveBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, sizeof(Vertex) * vertexCount,
+                                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                                      clientBuffer.buffer, clientBuffer.memory);
+
+    auto& serverBuffer = m_vertexBuffers[label].serverResource;
+
+    serverBuffer.requirements = createExclusiveBuffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                                      sizeof(Vertex) * vertexCount, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                      serverBuffer.buffer, serverBuffer.memory);
+}
+
+uint32_t VulkanEngine::findAdequateMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    const auto& givenProperties = m_physicalDeviceInfo.memoryProperties;
+    for (uint32_t i = 0; i < givenProperties.memoryTypeCount; ++i) {
+        if (typeFilter & (1 << i) && (givenProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    throw std::runtime_error("Failed to find an adequate memory type.");
+}
+
+void VulkanEngine::createAllDeclaredVertexBuffers() {
+    for (auto& vertexBufferGroup : m_vertexBuffers) {
+
+        const auto& bufferLabel = vertexBufferGroup.first;
+        const auto& hostVertices = vertexBufferGroup.second.data;
+        auto& clientBuffer = vertexBufferGroup.second.clientResource;
+        auto& serverBuffer = vertexBufferGroup.second.serverResource;
+
+        // Isolated buffer
+        if (vertexBufferGroup.second.isServerResourceEnabled) {
+            createIsolatedVertexBuffer(bufferLabel, hostVertices.size());
+
+            void* data;
+            vkMapMemory(m_device, clientBuffer.memory, 0, VK_WHOLE_SIZE, 0, &data);
+            memcpy(data, hostVertices.data(), sizeof(Vertex) * hostVertices.size());
+            vkUnmapMemory(m_device, clientBuffer.memory);
+
+            copyBufferData(clientBuffer.buffer, serverBuffer.buffer, clientBuffer.requirements.size);
+        }
+        // Coherent buffer
+        else {
+            createCoherentVertexBuffer(bufferLabel, hostVertices.size());
+
+            void* data;
+            vkMapMemory(m_device, clientBuffer.memory, 0, VK_WHOLE_SIZE, 0, &data);
+            memcpy(data, hostVertices.data(), sizeof(Vertex) * hostVertices.size());
+            vkUnmapMemory(m_device, clientBuffer.memory);
+        }
+    }
+}
+
+VkMemoryRequirements VulkanEngine::createExclusiveBuffer(VkBufferUsageFlags usage, VkDeviceSize size, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& memory) {
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bufferInfo.flags = 0; // Used to configure sparse buffer memory.
+
+    if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create buffer.");
+    }
+
+    VkMemoryRequirements requirements = {};
+    vkGetBufferMemoryRequirements(m_device, buffer, &requirements);
+
+    VkMemoryAllocateInfo memoryAllocInfo = {};
+    memoryAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryAllocInfo.allocationSize = requirements.size;
+    memoryAllocInfo.memoryTypeIndex = findAdequateMemoryType(requirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(m_device, &memoryAllocInfo, nullptr, &memory) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate buffer memory.");
+    }
+
+    vkBindBufferMemory(m_device, buffer, memory, 0);
+
+    return requirements;
+}
+
+void VulkanEngine::copyBufferData(VkBuffer src, VkBuffer dst, VkDeviceSize size) {
+    VkCommandBufferAllocateInfo cmdBufferAllocInfo = {};
+    cmdBufferAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdBufferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdBufferAllocInfo.commandPool = m_commandPool;
+    cmdBufferAllocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmdBuffer = {};
+    vkAllocateCommandBuffers(m_device, &cmdBufferAllocInfo, &cmdBuffer);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+    VkBufferCopy copyRegion = {};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = size;
+    vkCmdCopyBuffer(cmdBuffer, src, dst, 1, &copyRegion);
+
+    vkEndCommandBuffer(cmdBuffer);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmdBuffer;
+
+    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_graphicsQueue);
+
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmdBuffer);
+}
+
+void VulkanEngine::createIndexBuffer(const std::string& label, uint32_t indicesCount) {
+    // Only can create vertex buffer when it has been declared.
+    assert(m_indexBuffers.find(label) != m_indexBuffers.end());
+
+    auto& clientBuffer = m_indexBuffers[label].clientResource;
+
+    clientBuffer.requirements = createExclusiveBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, sizeof(uint32_t) * indicesCount,
+                                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                                      clientBuffer.buffer, clientBuffer.memory);
+
+    auto& serverBuffer = m_indexBuffers[label].serverResource;
+
+    serverBuffer.requirements = createExclusiveBuffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                                      sizeof(uint32_t) * indicesCount, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                      serverBuffer.buffer, serverBuffer.memory);
+}
+
+void VulkanEngine::createAllDeclaredIndexBuffers() {
+    for (auto& indexBufferGroup : m_indexBuffers) {
+
+        const auto& bufferLabel = indexBufferGroup.first;
+        const auto& hostIndices = indexBufferGroup.second.data;
+        auto& clientBuffer = indexBufferGroup.second.clientResource;
+        auto& serverBuffer = indexBufferGroup.second.serverResource;
+
+        createIndexBuffer(bufferLabel, hostIndices.size());
+
+        void* data;
+        vkMapMemory(m_device, clientBuffer.memory, 0, VK_WHOLE_SIZE, 0, &data);
+        memcpy(data, hostIndices.data(), sizeof(uint32_t) * hostIndices.size());
+        vkUnmapMemory(m_device, clientBuffer.memory);
+
+        copyBufferData(clientBuffer.buffer, serverBuffer.buffer, clientBuffer.requirements.size);
+    }
+}
+
+void VulkanEngine::createDescriptorSetLayout() {
+    VkDescriptorSetLayoutBinding uboLayoutBinding = {};
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    uboLayoutBinding.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &uboLayoutBinding;
+
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descSetLayouts["main"]) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create descriptor set layouts.");
+    }
+}
+
+void VulkanEngine::createUniformBuffers() {
+    auto bufferSize = sizeof(UniformBufferObject);
+
+    m_uniformBuffer.resources.resize(m_swapchainImages.size());
+
+    for (size_t i = 0; i < m_swapchainImages.size(); ++i) {
+        m_uniformBuffer.resources[i].requirements = createExclusiveBuffer(
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, bufferSize,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                m_uniformBuffer.resources[i].buffer, m_uniformBuffer.resources[i].memory);
+    }
+}
+
+void VulkanEngine::updateUniformBuffers() {
+    UniformBufferObject ubo = {};
+    ubo.modelMat = glm::mat4(1.0f);
+    m_camera->updateViewMatrix(ubo.viewMat);
+    m_camera->updateProjMatrix(ubo.projMat);
+
+    void* data;
+    auto& memory = m_uniformBuffer.resources[m_currSwapchainImageIndex].memory;
+    vkMapMemory(m_device, memory, 0, VK_WHOLE_SIZE, 0, &data);
+    memcpy(data, &ubo, sizeof(ubo));
+    vkUnmapMemory(m_device, memory);
+}
+
+void VulkanEngine::createDescriptorPool() {
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.descriptorCount = m_swapchainImages.size();
+
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = m_swapchainImages.size();
+
+    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create descriptor pool.");
+    }
+}
+
+void VulkanEngine::createDescriptorSets() {
+    std::vector<VkDescriptorSetLayout> layouts(m_swapchainImages.size(), m_descSetLayouts["main"]);
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_descriptorPool;
+    allocInfo.descriptorSetCount = m_swapchainImages.size();
+    allocInfo.pSetLayouts = layouts.data();
+
+    m_descriptorSets.resize(m_swapchainImages.size());
+    if (vkAllocateDescriptorSets(m_device, &allocInfo, m_descriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate descriptor sets.");
+    }
+
+    for (size_t i = 0; i < m_swapchainImages.size(); ++i) {
+        VkDescriptorBufferInfo descBufferInfo = {};
+        descBufferInfo.buffer = m_uniformBuffer.resources[i].buffer;
+        descBufferInfo.offset = 0;
+        descBufferInfo.range = sizeof(UniformBufferObject);
+
+        VkWriteDescriptorSet descWrite = {};
+        descWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descWrite.dstSet = m_descriptorSets[i];
+        descWrite.dstBinding = 0;
+        descWrite.dstArrayElement = 0;
+        descWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descWrite.descriptorCount = 1;
+        descWrite.pBufferInfo = &descBufferInfo;
+        descWrite.pImageInfo = nullptr;
+        descWrite.pTexelBufferView = nullptr;
+
+        vkUpdateDescriptorSets(m_device, 1, &descWrite, 0, nullptr);
+    }
+}
+
+void VulkanEngine::translateCamera(float dx, float dy, float dz) {
+    auto T = dx * m_camera->right() + dy * m_camera->up() + dz * m_camera->lookAt();
+    m_camera->translate(T.x, T.y, T.z);
+}
+
+void VulkanEngine::rotateCamera(float dx, float dy) {
+    m_camera->rotate(dy, dx);
+}
+
+void VulkanEngine::zoomCamera(float delta) {
+    m_camera->zoom(delta);
+}
+
+void VulkanEngine::buildCamera() {
+    m_camera = std::make_unique<Camera>(m_surfaceInfo.pixelWidth, m_surfaceInfo.pixelHeight, 90.0f);
+
+    m_camera->setEye(glm::vec3(0.0f, 0.0f, -1.0f));
+
+    m_camera->setRight(glm::vec3(1.0f, 0.0f, 0.0f));
+    m_camera->setUp(glm::vec3(0.0f, 1.0f, 0.0f));
+    m_camera->setLookAt(glm::vec3(0.0f, 0.0f, 1.0f));
 }

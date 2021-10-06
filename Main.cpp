@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
     try {
         QApplication a(argc, argv);
         DisplayWindow w;
+        w.declareRenderResourceData();
         w.initVulkanEngine();
         w.show();
         return a.exec();

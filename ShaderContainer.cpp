@@ -10,16 +10,32 @@
 
 #include <fstream>
 #include <ios>
+#include <unistd.h>
 
+#include "Platforms/ExecuteCommand.h"
 #include "ShaderContainer.h"
 
 ShaderContainer::~ShaderContainer() {
     destroyAllShaderModules(); // In case someone forgets destroy created shader modules.
 }
 
-void ShaderContainer::addNewShader(
+void ShaderContainer::addGlslShader(const std::string& name, const std::string& filename, const std::string& binaryStorePath,
+                                    const std::string& entrypoint, ShaderContainer::StageType type) {
+    std::string glslcShaderStage;
+    compileGlslShader(filename, binaryStorePath);
+    addCompiledShader(name, binaryStorePath, entrypoint, type);
+}
+
+void ShaderContainer::compileGlslShader(const std::string& filename, const std::string& binaryStorePath) {
+    const char* glslcArgs[] = { "-o", binaryStorePath.c_str(), filename.c_str() };
+    if (!executeCommand("/Users/fort.w/VulkanSDK/1.2.189.0/macOS/bin/glslc", glslcArgs, 3)) {
+        throw std::runtime_error("Failed to execute GLSL compilation command.");
+    }
+}
+
+void ShaderContainer::addCompiledShader(
         const std::string& name,
-        const std::string& filename,
+        const std::string& binaryName,
         const std::string& entrypoint,
         ShaderContainer::StageType type)
 {
@@ -29,7 +45,7 @@ void ShaderContainer::addNewShader(
 
     shader.type = type;
     shader.entrypoint = entrypoint;
-    shader.buffer = readShaderFromBinary(filename);
+    shader.buffer = readShaderFromBinary(binaryName);
     shader.module = createShaderModule(shader.buffer);
 
     m_shaders[name] = shader;
@@ -40,7 +56,7 @@ VkPipelineShaderStageCreateInfo ShaderContainer::generateCreateInfo(const std::s
     VkPipelineShaderStageCreateInfo info = {};
 
     info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    info.stage = convertStageType(spirv.type);
+    convertStageType(spirv.type, info.stage);
     info.module = spirv.module;
     info.pName = spirv.entrypoint.c_str();
     info.pSpecializationInfo = nullptr;
@@ -101,14 +117,16 @@ VkShaderModule ShaderContainer::createShaderModule(const std::vector<char>& code
     return shaderModule;
 }
 
-VkShaderStageFlagBits ShaderContainer::convertStageType(ShaderContainer::StageType type) {
+void ShaderContainer::convertStageType(ShaderContainer::StageType type, VkShaderStageFlagBits& target) {
     switch (type) {
         case Undefined:
             throw std::runtime_error("Undefined shader stage type.");
         case Vertex:
-            return VK_SHADER_STAGE_VERTEX_BIT;
+            target = VK_SHADER_STAGE_VERTEX_BIT;
+            break;
         case Fragment:
-            return VK_SHADER_STAGE_FRAGMENT_BIT;
+            target = VK_SHADER_STAGE_FRAGMENT_BIT;
+            break;
         default:
             throw std::runtime_error("Unknown shader stage type.");
     }

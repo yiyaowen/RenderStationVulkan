@@ -46,22 +46,28 @@ add_executable(RenderStation
     ${VULKAN_INCLUDE_FILES}
 
     # Headers
-    VulkanEngine.h
+    Camera.h
     DisplayWindow.h
-    ShaderContainer.h
+    GraphicsResource.h
+    Platforms/ExecuteCommand.h
     Platforms/SurfaceCompatible.h
+    ShaderContainer.h
+    VulkanEngine.h
 
     # Sources
-    Main.cpp
-    VulkanEngine.cpp
+    Camera.cpp
     DisplayWindow.cpp
-    ShaderContainer.cpp
+    Main.cpp
+    Platforms/ExecuteCommand.mm
     Platforms/SurfaceCompatible.mm
+    ShaderContainer.cpp
+    VulkanEngine.cpp
 )
 
 if(APPLE)
 target_link_libraries(RenderStation
     PRIVATE "-framework AppKit"
+    PRIVATE "-framework Foundation"
     PRIVATE "-framework QuartzCore"
 )
 endif()

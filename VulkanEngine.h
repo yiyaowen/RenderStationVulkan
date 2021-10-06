@@ -21,6 +21,8 @@
 
 #include <QDebug>
 
+#include "Camera.h"
+#include "GraphicsResource.h"
 #include "ShaderContainer.h"
 
 #define FUNC_PARAM_UNUSED(x) ((void)(x))
@@ -56,9 +58,13 @@ namespace VulkanEngineStructs {
     };
 
     struct PhysicalDeviceInfo {
+        // Core infos.
         std::vector<const char*> supportedExtensions = {};
         QueueFamilyIndices queueFamilyIndices = {};
         SwapchainDetails swapchainDetails = {};
+
+        // Buffer infos.
+        VkPhysicalDeviceMemoryProperties memoryProperties = {};
     };
 }
 
@@ -161,6 +167,7 @@ private:
 
     ShaderContainer m_shaderContainer = {};
 
+    std::unordered_map<std::string, VkDescriptorSetLayout> m_descSetLayouts = {};
     std::unordered_map<std::string, VkPipelineLayout> m_pipelineLayouts = {};
 
     void createGraphicsPipelines();
@@ -224,6 +231,111 @@ private:
     VkPresentModeKHR selectSwapchainPresentMode(const std::vector<VkPresentModeKHR>& candidateModes);
 
     VkExtent2D selectSwapchainExtent2D(const VkSurfaceCapabilitiesKHR& capabilities);
+
+public:
+    inline std::string currBindVertexBufferLabel() { return m_currBindVertexBufferLabel; }
+    inline void setCurrBindVertexBufferLabel(const std::string& value) { m_currBindVertexBufferLabel = value; }
+
+    inline std::string currBindIndexBufferLabel() { return m_currBindIndexBufferLabel; }
+    inline void setCurrBindIndexBufferLabel(const std::string& value) { m_currBindIndexBufferLabel = value; }
+
+    void declareVertices(const std::string& bufferLabel, bool enableServerBuffer, const std::vector<Vertex>& vertices);
+
+    void declareIndices(const std::string& bufferLabel, const std::vector<uint32_t>& indices);
+
+private:
+    struct BufferResource {
+        VkBuffer  buffer = {};
+        VkDeviceMemory memory = {};
+        VkMemoryRequirements requirements = {};
+    };
+
+    struct VertexBuffer {
+        std::vector<Vertex> data = {};
+
+        BufferResource clientResource = {};
+
+        // Note this field should be decided when declaring, i.e. before creating the actual buffers.
+        bool isServerResourceEnabled = false;
+        // Optional server resource (Unused if client resource is host visible and coherent)
+        BufferResource serverResource = {};
+
+        VertexBuffer() = default;
+        VertexBuffer(bool enableServerBuffer, const std::vector<Vertex>& vertices) {
+            isServerResourceEnabled = enableServerBuffer;
+            data = vertices;
+        }
+    };
+
+    std::unordered_map<std::string, VertexBuffer> m_vertexBuffers = {};
+
+    std::string m_currBindVertexBufferLabel = {};
+
+    void createCoherentVertexBuffer(const std::string& label, size_t vertexCount);
+
+    void createIsolatedVertexBuffer(const std::string& label, size_t vertexCount);
+
+    uint32_t findAdequateMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
+
+    void createAllDeclaredVertexBuffers();
+
+    VkMemoryRequirements createExclusiveBuffer(VkBufferUsageFlags usage, VkDeviceSize size, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& memory);
+
+    void copyBufferData(VkBuffer src, VkBuffer dst, VkDeviceSize size);
+
+    struct IndexBuffer {
+        std::vector<uint32_t> data = {};
+
+        BufferResource clientResource = {};
+        BufferResource serverResource = {};
+
+        IndexBuffer() = default;
+        explicit IndexBuffer(const std::vector<uint32_t>& indices) { data = indices; }
+    };
+
+    std::unordered_map<std::string, IndexBuffer> m_indexBuffers = {};
+
+    std::string m_currBindIndexBufferLabel = {};
+
+    void createIndexBuffer(const std::string& label, uint32_t indicesCount);
+
+    void createAllDeclaredIndexBuffers();
+
+private:
+    void createDescriptorSetLayout();
+
+    struct UniformBuffer {
+        UniformBufferObject data = {};
+        std::vector<BufferResource> resources = {};
+    };
+
+    UniformBuffer m_uniformBuffer = {};
+
+    void createUniformBuffers();
+
+    uint32_t m_currSwapchainImageIndex = 0;
+
+    void updateUniformBuffers();
+
+    VkDescriptorPool m_descriptorPool = {};
+
+    void createDescriptorPool();
+
+    std::vector<VkDescriptorSet> m_descriptorSets = {};
+
+    void createDescriptorSets();
+
+public:
+    void translateCamera(float dx, float dy, float dz);
+
+    void rotateCamera(float dx, float dy);
+
+    void zoomCamera(float delta);
+
+private:
+    std::unique_ptr<Camera> m_camera = nullptr;
+
+    void buildCamera();
 };
 
 #endif // VULKAN_ENGINE_H

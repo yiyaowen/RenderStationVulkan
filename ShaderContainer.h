@@ -39,7 +39,12 @@ public:
     inline void setDevice(VkDevice* device) { m_device = device; }
     inline VkDevice* device() { return m_device; }
 
-    void addNewShader(const std::string& name, const std::string& filename, const std::string& entrypoint, StageType type);
+    void addGlslShader(const std::string& name, const std::string& filename, const std::string& binaryStorePath,
+                       const std::string& entrypoint, StageType type);
+
+    void compileGlslShader(const std::string& filename, const std::string& binaryStorePath);
+
+    void addCompiledShader(const std::string& name, const std::string& binaryName, const std::string& entrypoint, StageType type);
 
     VkPipelineShaderStageCreateInfo generateCreateInfo(const std::string& name);
 
@@ -52,7 +57,7 @@ private:
 
     VkShaderModule createShaderModule(const std::vector<char>& codes);
 
-    VkShaderStageFlagBits convertStageType(StageType type);
+    void convertStageType(StageType type, VkShaderStageFlagBits& target);
 
 private:
     VkDevice* m_device = nullptr;
